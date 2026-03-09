@@ -38,24 +38,23 @@ or any case where real-life validator behaviour matters.
 
 ```toml
 [dev-dependencies]
-litesvm          = "0.9"
-litesvm-token    = "0.4"   # SPL Token helpers — CreateMint, MintTo, CreateAssociatedTokenAccount
-solana-keypair   = "2"
-solana-pubkey    = "2"
-solana-message   = "2"
-solana-transaction = "2"
-solana-signer    = "2"
-solana-native-token = "2"  # LAMPORTS_PER_SOL
-solana-account   = "2"     # Account struct for set_account
-solana-sdk-ids   = "2"     # system_program::ID, etc.
-solana-instruction = "2"
-# For Anchor tests only:
-anchor-lang      = { version = "0.31", features = ["init-if-needed"] }
-anchor-spl       = "0.31"
-```
+litesvm = "0.9.1"
+litesvm-token = "0.9.1"
 
-> **Note on GLIBC:** LiteSVM requires GLIBC ≥ 2.38. On older Linux systems
-> (Ubuntu 20.04, Debian 11) use `solana-bankrun` instead.
+solana-instruction = "3.1.0"
+solana-keypair = "3.1.0"
+solana-native-token = "3.0.0"
+solana-pubkey = "4.1.0"
+solana-signer = "3.0.0"
+solana-transaction = "3.0.2"
+solana-message = "3.0.1"
+solana-sdk-ids = "3.1.0"
+spl-token-2022 = { version = "10.0.0", features = ["no-entrypoint"]}
+spl-associated-token-account = "8.0.0"
+solana-rpc-client = "3.1.9"
+solana-address = "2.2.0"
+solana-account = "4.1.0"
+```
 
 ### Running tests
 
@@ -268,12 +267,12 @@ fn send_tx(
 
 ---
 
-## 3. SYSVAR & TIME CONTROL
+## 3. SYSVAR & TIME CONTROL 
 
 Full sysvar manipulation is one of LiteSVM's most powerful capabilities —
 essential for testing time locks, deadlines, and slot-dependent logic.
 
-### 3a. Time travel (Clock)
+### 3a. Time Travel (Clock) if the instructions require time manipulation
 
 ```rust
 use anchor_lang::prelude::Clock; // or solana_clock::Clock for native
