@@ -144,14 +144,10 @@ The skill fires on any of the following:
 This skill is under active development. Planned expansions:
 
 - [ ] Native Rust example program (staking vault)
-- [x] Pinocchio framework reference — zero-copy patterns, bytemuck, wincode serialization
-- [x] LiteSVM testing reference — in-process VM, sysvar control, CU profiling
 - [ ] Additional reference sources: SPL Token-2022 extension security, Metaplex deep-dive, oracle manipulation patterns
 - [ ] Anchor v0.31+ specific patterns
 - [ ] Invariant testing guidance (Trident, Fuzz)
 - [ ] Common DeFi pattern references: AMM, lending, bonding curves
-- [ ] LiteSVM + Pinocchio worked example in `examples/`
-- [ ] LiteSVM + Anchor worked example in `examples/`
 
 The reference files are the living core of this skill. Every new vulnerability source, audit finding, or best practice I encounter gets distilled and added. The skill grows with the threat landscape.
 
