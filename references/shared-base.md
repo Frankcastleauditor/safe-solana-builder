@@ -336,3 +336,136 @@ Apply this curiosity to every design decision, not just during code review.
 - Keep individual log messages concise. Solana truncates transaction logs at ~10 KB per transaction — long free-form strings are silently dropped mid-audit trail.
 - Emit critical state (amounts, authorities, timestamps, before/after balances) as **structured, fixed-size on-chain events** — not free-form strings.
 - Never rely solely on logs for auditability. Persist critical state in on-chain accounts — logs are ephemeral and truncatable by the runtime.
+
+---
+
+## 21. REWARD ACCOUNTING — PROPORTIONAL SCALING & DEBT SETTLEMENT
+
+Reward math is the single most exploited category in staking and yield protocols. Every pattern below maps to a validated Critical or High finding.
+
+### 21.1 Settle Before Shrinking (Rounding Mismatch in Partial Unstake)
+- **Never scale `reward_debt` proportionally when reducing a position without settling first.**
+- Independent floor divisions create a gap: `attacker calls partial_unstake(1) + claim_rewards` in a loop to manufacture rewards with zero new time elapsed.
+- Fix: settle all pending rewards (compute `pending = accrued - reward_debt`, pay out) **before** shrinking the position, then reset `reward_debt` to a fresh checkpoint against the new, smaller principal.
+
+### 21.2 Reward Debt Must Be Updated on Every Payout Path — No Exceptions
+- If `claim_rewards` subtracts `reward_debt` but `unstake_locked` does not, a user who claims then unstakes receives the same rewards twice.
+- **Every instruction that pays out rewards must follow the same formula:** `pending = total_accrued - reward_debt`, pay `pending`, then set `reward_debt = total_accrued`.
+- Audit every code path that touches balances: claim, unstake, withdraw, liquidate, emergency exit. Missing even one is a Critical.
+
+### 21.3 Never Retroactively Apply a Changed Rate
+- Never store a single mutable global `reward_rate` and multiply it by `total_elapsed` across the full duration.
+- When `update_reward_rates` overwrites the rate, every rate change retroactively alters all existing positions — attackers front-run rate increases to steal yield.
+- Use one of:
+  - **Per-position rate snapshots**: store `rate_at_stake_time` in the position account, compute rewards against that.
+  - **Global accumulator pattern**: maintain `reward_per_token_stored` (updated atomically on every rate change or interaction), store `reward_per_token_paid` per position; `pending = (reward_per_token_stored - reward_per_token_paid) * position_size`.
+
+### 21.4 Dead Share Price — Yield Must Update the Exchange Rate
+- In share-based (stX/totalStaked) models, there must be a code path that increases the accounting numerator (`total_staked`) independently of the share supply.
+- If yield enters the vault but the exchange rate variable is never updated, the share price is permanently frozen — new depositors receive the same shares as if no yield had accumulated.
+- Any yield accrual instruction must call `total_staked = total_staked.checked_add(yield_amount)?` before any share math.
+
+### 21.5 Inflation Attack / First Depositor
+- In share-based pools, the first depositor can stake a dust amount, burn most receipt tokens directly via SPL, inflate the exchange rate, then steal from subsequent depositors via rounding.
+- **Fix (require one of):**
+  - Mint dead shares to a burn address on the first deposit (e.g., 1000 locked shares).
+  - Enforce a minimum initial deposit large enough to make the inflation attack economically infeasible.
+  - Use virtual balances: add a virtual offset to both numerator and denominator before computing shares.
+
+### 21.6 Fee-on-Transfer Delta Accounting (Token-2022)
+- When using Token-2022 mints with transfer fees, the vault receives `amount - fee` but a naive implementation records `amount`.
+- **Always use balance-delta accounting:**
+  ```rust
+  let before = ctx.accounts.vault.amount;
+  token_interface::transfer_checked(cpi_ctx, amount, decimals)?;
+  ctx.accounts.vault.reload()?;
+  let actual_received = ctx.accounts.vault.amount.checked_sub(before).ok_or(ErrorCode::Arithmetic)?;
+  // Use actual_received for all state updates — never `amount`
+  ```
+- Call `reload()` after every CPI before reading any account field.
+
+### 21.7 Rewards Must Come from a Funded Reward Source — Not Principal
+- If reward payouts are sourced from the same vault that holds user principal, the protocol is structurally insolvent from the first claim — rewards come from other users' deposits.
+- Rewards must come from a **dedicated rewards vault**, a funded reserve, or an external yield source.
+- At `initialize` time, assert that a rewards vault exists and is sufficiently funded for the program's stated duration.
+- Add a `check_solvency` view instruction that clients can call before staking.
+
+---
+
+## 22. VAULT & POOL ARCHITECTURE — WITHDRAWAL PATHS & SOLVENCY
+
+### 22.1 Every PDA-Controlled Vault Must Have a Withdrawal Path
+- If an instruction creates a PDA-controlled token vault (e.g., donation vault, insurance fund, fee accumulator), there must be a corresponding instruction to withdraw from it.
+- Without a withdrawal path, tokens sent to that vault are permanently locked with no recovery mechanism.
+- Before shipping: trace every token flow into PDA-controlled accounts and confirm a corresponding outflow instruction exists with appropriate access control.
+
+---
+
+## 23. TOKEN-2022 EXTENSION VALIDATION AT INITIALIZATION
+
+Accepting an arbitrary Token-2022 mint without extension whitelisting opens critical attack surface.
+
+### 23.1 Validate Extensions at `initialize` — Reject Dangerous Ones
+At program initialization (or when a new mint is registered), validate the mint's Token-2022 extensions:
+
+- **Reject `PermanentDelegate`**: a permanent delegate can seize tokens from any account associated with the mint — including your vault. This is a complete vault drain vector.
+- **Reject uncontrolled `FreezeAuthority`**: an external freeze authority can freeze your vault's token account, permanently DoS-ing withdrawals.
+- **Require `TransferHook`-compatible CPI patterns**: if the mint uses a transfer hook, your `transfer_checked` CPI must forward `remaining_accounts` containing the hook's accounts. Skipping this causes the CPI to fail silently or revert.
+- **Reject `ConfidentialTransfers`** unless your program explicitly handles the confidential transfer protocol.
+
+```rust
+// Example: reject PermanentDelegate at init
+let mint_data = ctx.accounts.staking_mint.to_account_info();
+if let Ok(Some(_)) = get_extension::<PermanentDelegate>(&mint_data.data.borrow()) {
+    return Err(ErrorCode::UnsupportedMintExtension.into());
+}
+```
+
+- Maintain an explicit **extension allowlist** in your program's config: only mints with approved extension sets can be registered.
+
+---
+
+## 24. ACCESS CONTROL — LOCKUP ENFORCEMENT & ADMIN KEY ROTATION
+
+### 24.1 Lockup Must Be Enforced on ALL Reward Claim Paths
+- If a locked staking protocol offers both `claim_rewards` (mid-lockup, yield only) and `instant_unlock` (no yield, principal only), the `claim_rewards` instruction must explicitly enforce lockup expiry.
+- Without this check, users collect full yield then instantly exit — the lockup incentive mechanism is entirely bypassed.
+- Fix: add `require!(clock.unix_timestamp >= entry.unlock_at, ErrorCode::LockupNotExpired)` to **every** yield-paying instruction, not just `unstake`.
+
+### 24.2 Admin Key Must Be Rotatable (Two-Step Pattern)
+- A single immutable admin key is a permanent single point of failure. Key compromise = full protocol takeover with no recovery.
+- **Always implement a two-step rotation:**
+  ```rust
+  // Step 1: current admin proposes a new admin
+  pub fn propose_admin(ctx: Context<ProposeAdmin>, new_admin: Pubkey) -> Result<()> { ... }
+  // Step 2: new admin accepts (proves key control)
+  pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> { ... }
+  ```
+- Store `pending_admin: Option<Pubkey>` in your config account.
+- For 🔴 Critical programs: wrap admin key rotation in a timelock (e.g., 48-hour delay before acceptance is valid).
+
+---
+
+## 25. BPF RUNTIME — STACK FRAME LIMIT
+
+### 25.1 Stack Frame Hard Limit: 4096 Bytes
+- The BPF VM enforces a hard **4096-byte stack frame limit** per instruction invocation.
+- Anchor instruction contexts with 6+ `InterfaceAccount` or `Account` fields — especially alongside large state accounts — can exceed this limit, causing **runtime access violations** (not compile-time errors).
+- This is a complete DoS: the instruction always reverts. There is no graceful degradation.
+
+**Detection:** After `anchor build`, check for:
+```
+Stack offset of XXXX exceeded max offset of 4096 by YYY bytes
+```
+Treat this as a hard blocker — it must be resolved before deployment.
+
+**Fix:** Wrap large account fields in `Box<>` to move them from the stack to the heap:
+```rust
+// Before (stack allocated — dangerous with many accounts)
+pub vault: Account<'info, VaultState>,
+
+// After (heap allocated — safe)
+pub vault: Box<Account<'info, VaultState>>,
+```
+- Apply `Box<>` to the largest account types first (`InterfaceAccount<Mint>`, `InterfaceAccount<TokenAccount>`, large custom state accounts).
+- For Native Rust / Pinocchio: avoid large local variable declarations inside instruction handlers; pull complex structs behind references or allocate on the heap explicitly.

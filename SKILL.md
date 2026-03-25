@@ -24,6 +24,11 @@ This skill systematically addresses the following vulnerability classes derived 
 - **Access control & authorization bugs** — missing signer checks, frontrunnable initialization, inbound transfer auth, post-expiry flows
 - **State management errors** — coupled-field resets, counter drift, vested/unvested balance separation, rollback safety
 - **PDA-related issues** — zombie accounts, seed collisions, canonical bump enforcement, lifecycle closure
+- **Reward accounting exploits** — rounding gaps in partial unstake, dual-path reward debt bypass, retroactive rate application, dead share price, inflation/first-depositor attack, fee-on-transfer delta errors, rewards sourced from principal
+- **Vault & pool architecture** — missing withdrawal paths on PDA-controlled vaults
+- **Token-2022 extension validation** — PermanentDelegate seizure, uncontrolled FreezeAuthority, TransferHook CPI forwarding, ConfidentialTransfer compatibility
+- **Admin key security** — two-step rotation pattern, timelock recommendations for Critical programs
+- **BPF runtime limits** — 4096-byte stack frame DoS, Box<> mitigation for large account types
 
 ---
 
@@ -62,7 +67,7 @@ Once **both** the framework and testing approach are chosen, read the following 
 **before writing a single line of code**:
 
 1. **Always read first (both files):**
-   - `references/shared-base.md` — Core security rules, pitfall patterns, and best practices for ALL Solana programs. Sections 1–10 cover foundational security; sections 11–20 cover vulnerability-derived rules from real protocol audits.
+   - `references/shared-base.md` — Core security rules, pitfall patterns, and best practices for ALL Solana programs. Sections 1–20 cover foundational security; sections 21–25 cover vulnerability-derived rules from real protocol audits (reward accounting, vault architecture, Token-2022 extension validation, admin key rotation, BPF stack frame limits).
 
 2. **Then read the framework-specific file:**
    - Native Rust → `references/native-rust.md`
@@ -230,8 +235,11 @@ Each example folder contains:
 
 - **Simple programs (counter, hello world):** Still apply all checks. Simplicity is not an excuse for insecure patterns.
 - **Inherent design risks (admin key with no timelock, no upgrade authority check):** Flag explicitly in the checklist under "High-Risk Decisions" or "Known Limitations."
-- **Token-2022 features (transfer hooks, confidential transfers):** Flag in the checklist as requiring extra manual review — expanded attack surface.
+- **Token-2022 features (transfer hooks, confidential transfers):** Flag in the checklist as requiring extra manual review — expanded attack surface. Always validate extensions at `initialize` per shared-base §23.
 - **Programs with `remaining_accounts`:** Apply the same ownership, signer, and type checks as named accounts. Flag in checklist.
 - **Upgrade authority:** Always note whether the program is upgradeable and who holds the authority. Recommend a timelock or multisig for 🔴 Critical programs.
+- **Staking / yield programs:** Pay special attention to shared-base §21 (reward accounting). Every reward payout path must update `reward_debt`. Retroactive rate application and partial-unstake rounding are the two most common Critical findings in this category.
+- **Share-based pools (stX/totalStaked):** Apply §21.4 (dead share price) and §21.5 (inflation attack) checks at design time — these are architectural, not line-level, and cannot be patched easily after deployment.
+- **Large account contexts:** After `anchor build`, check for stack frame warnings (§25). Apply `Box<>` to large account fields if the warning appears.
 
 - **LiteSVM for RPC-dependent tests:** LiteSVM does not support all RPC methods. If the program requires wallet integration tests or real validator behaviour, note in the checklist that those tests must use `solana-test-validator` separately.
