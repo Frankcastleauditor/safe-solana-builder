@@ -164,6 +164,8 @@ CPI is the most complex attack surface in Solana. Every CPI is a trust boundary.
 - Always set the `owner` field of state accounts to your program's address. This is your primary access control for account data.
 - Never allow an account's data to be modified by a program that does not own it.
 - Never allow accounts to exceed **10 MiB** of data. Never allow total per-transaction resize to exceed **20 MiB**.
+- Size accounts using the serialized layout, not Rust in-memory layout. For Anchor accounts, prefer explicit `INIT_SPACE`/max-len-based sizing over `size_of::<T>()`.
+- `size_of::<T>()` is a memory-layout metric (alignment/padding/container metadata), not an on-chain encoding guarantee. Using it for account allocation can under-allocate after schema changes and cause init/write DoS.
 
 ### 6.2 Rent Exemption
 - **Always fund new accounts with at least two years' worth of rent** (the rent-exempt threshold).
@@ -229,6 +231,19 @@ Mixing legacy token functions with Token-2022 mints causes silent DoS.
 ### 9.3 Handle `remaining_accounts` With Full Rigor
 - If you iterate over `ctx.remaining_accounts`, apply the **same ownership, signer, and type checks** as you do for named accounts.
 - `remaining_accounts` is the easiest place to inject malicious accounts because developers assume they've already been validated.
+
+### 9.4 Never `unwrap()`/`expect()` on User-Controlled Option/Result Paths
+- Instruction handlers must return typed program errors, not panic. Avoid `unwrap()`/`expect()` on `Option`/`Result` values influenced by accounts or instruction data.
+- This is especially important for optional accounts (`Option<Account<...>>`): missing inputs should map to explicit custom errors via `ok_or(...)`.
+- Treat panic paths as reliability/security bugs because they produce opaque client failures and bypass normal error semantics.
+
+```rust
+let account_state = ctx
+    .accounts
+    .optional_account
+    .as_ref()
+    .ok_or(ErrorCode::MissingRequiredAccount)?;
+```
 
 ---
 
@@ -317,6 +332,7 @@ Apply this curiosity to every design decision, not just during code review.
 - Validate token mints against a protocol allowlist or framework constraints (`mint::authority`, `mint::decimals`). An unconstrained mint allows arbitrary tokens to be injected into protocol flows.
 - Reject same-asset operations where distinct assets are required: `require!(input_mint != output_mint)`. Same-token operations can be exploited to manipulate fee accounting or pool invariants.
 - Enforce maximum sizes on variable-length inputs (messages, payloads, URIs) **before encoding**. Unbounded inputs cause compute overruns and silent log truncation.
+- For user-supplied metadata strings (for example name/symbol/URI), enforce protocol-level hygiene: non-empty required fields, explicit length bounds, and URI scheme allowlists. Do not rely only on downstream program/library maximums.
 - Verify protocol-owned addresses (fee recipients, config accounts) are the expected, constrained accounts **before updating them**. An unconstrained update enables fee redirection to attacker-controlled accounts.
 
 ---
@@ -469,3 +485,326 @@ pub vault: Box<Account<'info, VaultState>>,
 ```
 - Apply `Box<>` to the largest account types first (`InterfaceAccount<Mint>`, `InterfaceAccount<TokenAccount>`, large custom state accounts).
 - For Native Rust / Pinocchio: avoid large local variable declarations inside instruction handlers; pull complex structs behind references or allocate on the heap explicitly.
+
+---
+
+## 26. STATE MACHINE & LIFECYCLE INTEGRITY
+
+### 26.1 Sentinel Timestamps Must Be Valid Unix Times
+- Never use `0` or any epoch-era value as a sentinel for a timestamp that feeds arithmetic comparisons with current time.
+- If `expiry_ts = 0` and you compute `expiry_ts + grace_period`, the grace window anchors to 1970 and expires immediately.
+- For immediate expiry, use `clock.unix_timestamp` (now), not `0`.
+- If a special sentinel is truly needed, branch explicitly and bypass timestamp arithmetic for that case.
+
+```rust
+// WRONG
+expiry_ts = if immediate { Some(0) } else { Some(clock.unix_timestamp) };
+// Later: require!(clock < expiry_ts + grace_period) — fails instantly for 0
+
+// RIGHT
+expiry_ts = Some(clock.unix_timestamp);
+// Or for truly instant expiry:
+expiry_ts = Some(clock.unix_timestamp.checked_sub(grace_period).unwrap_or(0));
+```
+
+### 26.2 Every Path to a Terminal State Must Execute the Same Cleanup
+- If multiple paths transition to the same terminal state (`Failed`, `Closed`, `Settled`), all must apply identical side effects.
+- Missing cleanup on one path can trap funds or leave accounting inconsistent.
+- Extract shared termination logic into a single helper (for example, `_on_terminate()`) and call it from every terminal transition.
+
+### 26.3 Zero Accounting Fields After Draining Assets
+- Any instruction that drains assets from a PDA (withdrawal, migration, completion) must zero matching accounting fields in the same transaction.
+- Stale reserves let later logic operate on phantom liquidity.
+- Prefer a post-drain invariant check (`actual == expected`) before finalizing state.
+- Any action that prices, redeems, or pays from tracked reserves must assert a **backing invariant** against real balances before execution. Status flags alone are not sufficient safety gates.
+- If liquidity is externalized/migrated, disable reserve-based actions until reserves are re-seeded and accounting is reinitialized atomically.
+
+```rust
+// After transferring all assets out:
+state.sol_balance = 0;
+state.token_balance = 0;
+```
+
+### 26.4 Status Transition Guards Must Use Allowlists, Not Denylists
+- For actions limited to "active" entities, check an explicit allowlist of valid source states.
+- Denylist checks like `status != Initial` accidentally permit terminal states.
+
+```rust
+// WRONG — denylist
+require!(status != Status::Initial);
+
+// RIGHT — allowlist
+require!(
+    status == Status::Active || status == Status::Pending,
+    "action only applies to active or pending entities"
+);
+```
+
+### 26.5 Preserve Sub-State on Transitions Instead of Hardcoding
+- Primary-state transitions should not blindly reset secondary status.
+- Hardcoding a sub-state can remove lifecycle locks (for example, migration readiness).
+- Restore prior sub-state from persisted data or conditionally retain it.
+
+```rust
+// WRONG — hardcodes sub-state
+entity.secondary_status = SecondaryStatus::Open;
+
+// RIGHT — restore from saved state
+entity.secondary_status = entity
+    .saved_secondary_status
+    .unwrap_or(SecondaryStatus::Open);
+```
+
+### 26.6 Paired Time Gates Must Share One Deadline Source
+- When one lifecycle timestamp controls two opposite permissions (for example, **action allowed until deadline** and **cleanup allowed after deadline**), compute one canonical `deadline_ts` and reuse it everywhere.
+- Never duplicate time-gate math inline across handlers. Divergent inequality direction, stale assumptions, or sentinel handling can invert intended permissions and violate lifecycle guarantees.
+- If an "immediate", "no grace", or special mode exists, model it with an explicit enum/flag and dedicated branching. Do not overload timestamp fields with magic values.
+
+```rust
+let deadline_ts = event_ts.checked_add(grace_period).ok_or(ErrorCode::Arithmetic)?;
+let can_action = now <= deadline_ts;
+let can_finalize = now > deadline_ts;
+```
+
+### 26.7 Terminal States Must Be Absorbing (Non-Rewritable)
+- Treat terminal states as **absorbing nodes** in the state machine: once entered, they cannot transition to non-terminal states by default.
+- Enforce transitions from a single canonical transition matrix (or helper), and validate `(current_state, next_state)` before any side effects.
+- Access control is not a substitute for transition validation. An authorized actor can still perform an invalid lifecycle rewrite if transition guards are permissive.
+- Avoid exclusion-style predicates (`state != X`). Use explicit allowlists of valid source states per instruction.
+- If a recovery path is intentionally supported, model it as a distinct transition with strict preconditions and explicit audit-trail events.
+
+```rust
+require!(is_allowed_transition(current_state, next_state), ErrorCode::InvalidTransition);
+```
+
+---
+
+## 27. SLIPPAGE & FEE ORDERING
+
+### 27.1 Slippage Guards Must Protect Net Amount, Not Gross
+- If fees are deducted from user proceeds (or added to user cost), slippage validation must compare against net user outcome.
+- Checking only gross AMM output can pass while user receives less than `min_output`.
+- Keep API/event naming unambiguous (`gross_out`, `fee_amount`, `net_out`) so clients cannot misinterpret slippage-protected values.
+- Enforce slippage on the user's final net outcome, independent of how fees are collected. Separate fee transfers in the same instruction must be counted in that net result.
+
+```rust
+// WRONG — checks gross
+let output = amm_swap(input, ...);
+require!(output >= min_output); // user gets output - fee
+
+// RIGHT — checks net
+let output = amm_swap(input, ...);
+let fee = calculate_fee(output, fee_bps);
+let net = output - fee;
+require!(net >= min_output);
+```
+
+### 27.2 Fee Base Must Match the Actual Swapped Amount
+- Charge fees on `source_amount_swapped` (actual consumed amount), not always on raw user input.
+- Partial fills and rounding make input and consumed amount diverge.
+- Use one canonical executed base amount for fee calculation, state/accounting updates, and events. Mixing requested and executed amounts across these paths causes silent economic drift.
+
+```rust
+// WRONG — fees on raw input
+let fee = calculate_fee(user_input, fee_bps);
+
+// RIGHT — fees on actual swapped amount
+let fee = calculate_fee(actual_swapped, fee_bps);
+```
+
+### 27.3 Fee Collection Must Not Block the User's Payout
+- Charging fees from wallet balance before payout can block exits for users with no spare SOL.
+- Prefer deducting fee from proceeds to avoid requiring upfront wallet SOL.
+
+```rust
+// WRONG — fee before payout
+system_program::transfer(user → treasury, fee)?; // user needs SOL upfront
+vault.lamports -= proceeds;
+user.lamports += proceeds;
+
+// RIGHT — fee deducted from payout
+let net = proceeds - fee;
+vault.lamports -= proceeds;
+user.lamports += net;
+treasury.lamports += fee;
+```
+
+---
+
+## 28. BONDING CURVE & AMM INTEGRITY
+
+### 28.1 Cap Purchases at the Completion Threshold
+- If a curve has a completion threshold, clamp buys so sold amount never exceeds remaining capacity.
+- Overshoot can consume reserves needed for downstream actions (LP seeding, withdrawals, fees), causing reverts or underflows.
+- After applying any cap/clip to execution size, recompute outputs and re-check user slippage bounds against the **actual executed output**. Input-side limits alone do not protect output guarantees.
+- Completion-triggering trades must preserve completion-path solvency invariants (for example, reserves needed by settlement/fee logic). Do not allow a trade to mark terminal state if terminal handlers would immediately fail arithmetic or accounting checks.
+
+```rust
+let sold_so_far = total_supply - remaining_reserves;
+let remaining_capacity = threshold.saturating_sub(sold_so_far);
+let effective_buy = std::cmp::min(requested_amount, remaining_capacity);
+// Execute swap with effective_buy
+```
+
+### 28.2 Reserve Subtraction Must Target the Correct Accounting Layer
+- In virtual/real reserve models, subtraction must align with the layer used for output math.
+- If output uses `virtual + real` but subtraction only hits `real`, underflow is possible.
+- Either cap output at `real_reserves` or subtract from both reserve layers consistently.
+- When executable balance and restricted balance share one pool, enforce explicit spendable-balance bounds (`output <= spendable_balance`) and never consume restricted allocations.
+
+### 28.3 Validate Interdependent Config Fields Against Each Other, Not Stale State
+- For multi-field config updates, validate all new values against each other before writing state.
+- Writing one field early then validating against an unchanged sibling compares new-vs-old and can pass invalid configs.
+- Validate all new config values first, then write them together in one commit. Do not mix partial writes with validation.
+
+```rust
+// WRONG — writes A, then validates stale B against new A
+state.field_a = params.field_a;
+require!(state.field_b <= state.field_a); // field_b is still the OLD value
+state.field_b = params.field_b;
+
+// RIGHT — validate from params first
+require!(params.field_b <= params.field_a);
+state.field_a = params.field_a;
+state.field_b = params.field_b;
+```
+
+---
+
+## 29. PERMISSIONLESS INITIALIZATION & USER-CONTROLLED PARAMETERS
+
+### 29.1 Frontrunnable Initialization Without Identity Check
+- `init` prevents re-initialization but does not ensure the intended party is the initializer.
+- If initializer is auto-assigned as admin with no identity check, anyone can frontrun and seize control.
+- Constrain expected admin identity, use atomic deploy+configure flows, or use two-step ownership acceptance.
+- First-writer-wins initialization of shared control state is a namespace-capture risk. If identity is not authenticated at creation, an arbitrary actor can permanently claim control over that state and all downstream flows that trust it.
+- If initialization is permissionless, decouple creator from privileged authority and require an explicit authority-acceptance step before privileged instructions become active.
+
+### 29.2 User-Controlled Parameters That Affect Protocol Operations
+- Permissionless creation parameters that control protocol behavior can become griefing vectors if unbounded.
+- Extreme values can break fee collection, completion, cooldown semantics, or pricing.
+- Enforce bounded ranges at creation time.
+- Never let user-controlled parameters define release gates for assets or critical state transitions. Unlock conditions and time gates for restricted flows must be protocol-defined (or strictly bounded by protocol policy), not creator-defined.
+- User-chosen parameters must preserve state-machine reachability: while an entity is active, at least one valid forward path must remain. Reject parameter sets that can leave entities active but unable to progress.
+
+```rust
+require!(params.virtual_offset >= MIN_OFFSET, "offset too low — breaks pricing");
+require!(params.virtual_offset <= MAX_OFFSET, "offset too high — unreachable threshold");
+require!(
+    params.cooldown_timestamp <= clock.unix_timestamp + MAX_COOLDOWN,
+    "cooldown too far in the future"
+);
+```
+
+### 29.3 Unbounded Admin Config Parameters That Retroactively Break Live Entities
+- Mutable global config values read at execution time can brick already-live entities.
+- Example: cancellation fee greater than deposit causes refund underflow.
+- Either snapshot critical economics per entity at creation, or enforce config invariants on every update.
+- Validate parameter bounds in **every write path** (initialize, update, and migration/setup helpers). Never assume checks in one entrypoint protect all others.
+- When global parameters are snapshotted into per-entity state, validate at snapshot time too. Invalid captured values can permanently break that entity even after global settings are fixed.
+- Enforce both per-field domains and cross-field invariants before persisting any config change.
+- For fixed-total reserve/accounting models, enforce `sum(parts) <= total` and compute derived remainder fields with checked arithmetic (`checked_add`/`checked_sub`) to prevent wraparound-built invalid states.
+- For safety-critical economic/control parameters, enforce non-degenerate lower bounds (not just upper bounds). Zero or near-zero values can create pathological behavior and permanently poison newly snapshotted entities.
+
+```rust
+require!(config.cancel_fee <= config.min_deposit, "fee would brick refunds");
+require!(config.completion_fee < config.completion_threshold, "fee exceeds threshold");
+```
+
+### 29.4 Config Update APIs Must Preserve "No Change" Semantics
+- Partial config updates need tri-state behavior per field: **unchanged**, **set to value**, and (if supported) **explicitly clear**.
+- Never overload a single `Option<T>` parameter to mean both "not provided" and "clear the stored optional field." This causes silent config corruption on unrelated updates.
+- For optional stored fields, use an explicit patch enum or separate `clear_*` flags so callers can update one field without mutating others.
+- Keep semantics uniform across all fields in the same admin update instruction.
+- Avoid full-struct rewrites for routine admin changes. Prefer granular setters or patch-style updates so one-field changes cannot silently overwrite unrelated live config.
+
+```rust
+enum Patch<T> { Unchanged, Set(T), Clear }
+```
+
+---
+
+## 30. WITHDRAW & DRAIN SAFETY
+
+### 30.1 Withdrawal Amount Must Be Validated Against Protocol Allocation
+- If admin/user-supplied withdraw amounts are not capped by tracked allocation, over-withdrawal can steal assets reserved for other flows.
+- Withdrawal eligibility must also require that all earmarked liabilities are settled (pending payouts, rebates, escrowed distributions, accrued obligations). Do not permit residual-balance extraction while reserved liability fields remain nonzero.
+- Reconcile liabilities to their intended recipients before any residual transfer.
+- For repeat/partial withdrawals, enforce cumulative caps (`already_withdrawn + requested <= allocated`) and update accounting in the same transaction. Never let balance transfers and internal reserve/liability tracking diverge.
+
+```rust
+require!(withdraw_amount <= state.allocated_fee_balance, "exceeds allocated amount");
+require!(state.pending_liabilities == 0, "unsettled obligations");
+```
+
+### 30.2 Zero Accounting Fields After Completing a Drain
+- After full settlement/completion drains, zero all reserve/balance accounting fields.
+- Stale nonzero values confuse indexers, break invariants, and create upgrade-time hazards.
+- If a flow intentionally leaves a reserved remainder, set accounting fields to the exact post-transfer remainder (not pre-drain values) and assert they match on-chain balances.
+
+```rust
+// After draining all assets:
+state.sol_reserves = 0;
+state.token_reserves = 0;
+
+// If a reserved remainder intentionally stays:
+state.sol_reserves = 0;
+state.token_reserves = reserved_remainder;
+```
+
+---
+
+## 31. MISCELLANEOUS PATTERNS
+
+### 31.1 Mutable Shared Config Retroactively Affects Live Entities
+- If live entities reference shared mutable config at execution time, config updates can silently change active user economics.
+- Snapshot critical fee and threshold terms into per-entity state during creation.
+
+### 31.2 BPF Stack Frame DoS on Large Account Contexts
+- BPF instruction stack frames are capped at 4096 bytes; large `Accounts` contexts can exceed this and hard-revert.
+- Treat stack offset build warnings as blockers.
+- Use `Box<>` around large account fields to move them off stack.
+
+### 31.3 Unclosed Accounts Permanently Lock Rent
+- Terminal lifecycle instructions should close obsolete PDAs and return rent-exempt lamports to a trusted recipient.
+- Otherwise rent remains locked indefinitely.
+
+### 31.4 Fee Treasury Must Be Capable of Receiving Tokens
+- If treasury is stored as raw `Pubkey` and ATA is derived at runtime, that address must be capable of owning token accounts.
+- Misconfigured treasury ownership can permanently lock withdrawn tokens.
+- Validate treasury compatibility at config-time or store explicit ATA addresses.
+- Treasury authorities must also be sweepable: there must be a valid signer path (wallet/multisig or program signer seeds) to move tokens out after receipt.
+
+### 31.5 Token-2022 Mint Space Must Be Computed After All Extensions Are Declared
+- Account size must be computed from the final extension list.
+- Calculating size before optional extensions are added creates undersized mint accounts and initialization failure.
+
+```rust
+// WRONG — space computed before extensions are added
+let extensions: Vec<ExtensionType> = vec![];
+let space = ExtensionType::try_calculate_account_len::<Mint>(&extensions)?;
+create_account(..., space, ...)?;
+if has_metadata { extensions.push(ExtensionType::MetadataPointer); } // too late
+
+// RIGHT — declare all extensions first
+let mut extensions: Vec<ExtensionType> = vec![];
+if has_metadata { extensions.push(ExtensionType::MetadataPointer); }
+let space = ExtensionType::try_calculate_account_len::<Mint>(&extensions)?;
+create_account(..., space, ...)?;
+```
+
+### 31.6 Signer-as-New-Account Pattern Is Griefable
+- Creating new accounts from signer-supplied fresh keypairs is frontrunnable (attacker funds target address first).
+- This can force create-account failure and user retries.
+- Mitigate by preferring PDAs, generating keys just-in-time, and documenting retry semantics.
+
+### 31.7 Repeated Privileged Actions That Reset Time-Sensitive State
+- Privileged instructions that can be called repeatedly must not keep resetting expiry/cooldown timestamps.
+- Only set timestamps on first transition to prevent indefinite extension.
+
+```rust
+if state.expiry_ts.is_none() {
+    state.expiry_ts = Some(clock.unix_timestamp as u64);
+}
+// Subsequent calls leave the timestamp unchanged
+```

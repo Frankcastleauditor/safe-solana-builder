@@ -21,14 +21,22 @@ This skill systematically addresses the following vulnerability classes derived 
 
 - **Protocol-specific vulnerabilities** — oracle manipulation, fee bypass, slippage attacks, LP preprocessing gaps
 - **Logic flaws & edge cases** — dust DoS, time-unit mismatches, pre/post-fee inconsistencies, type narrowing
-- **Access control & authorization bugs** — missing signer checks, frontrunnable initialization, inbound transfer auth, post-expiry flows
+- **Access control & authorization bugs** — missing signer checks, frontrunnable initialization, namespace capture, inbound transfer auth, post-expiry flows
 - **State management errors** — coupled-field resets, counter drift, vested/unvested balance separation, rollback safety
+- **Lifecycle & state machine integrity** — absorbing terminal states, canonical transition matrices, paired time-gate divergence, user-param reachability constraints
 - **PDA-related issues** — zombie accounts, seed collisions, canonical bump enforcement, lifecycle closure
 - **Reward accounting exploits** — rounding gaps in partial unstake, dual-path reward debt bypass, retroactive rate application, dead share price, inflation/first-depositor attack, fee-on-transfer delta errors, rewards sourced from principal
-- **Vault & pool architecture** — missing withdrawal paths on PDA-controlled vaults
+- **Vault & pool architecture** — missing withdrawal paths on PDA-controlled vaults, spendable-vs-reserved balance confusion, backing invariant violations
+- **Slippage & fee ordering** — slippage on net (not gross) amount, fee base must match executed amount, unambiguous gross/fee/net naming
+- **AMM / bonding-curve safety** — completion-threshold capping, post-cap slippage recheck, terminal-state solvency, reserve layer alignment
+- **Config management** — every write-path validation, tri-state patch semantics, partial-update corruption, cross-field invariant enforcement, atomic commit
+- **Withdraw & drain safety** — cumulative caps for partial withdrawals, liability settlement before residual extraction, exact-remainder accounting after partial drains
 - **Token-2022 extension validation** — PermanentDelegate seizure, uncontrolled FreezeAuthority, TransferHook CPI forwarding, ConfidentialTransfer compatibility
+- **Treasury & fee recipient hygiene** — sweepable authority requirement, config-time ATA validation
 - **Admin key security** — two-step rotation pattern, timelock recommendations for Critical programs
 - **BPF runtime limits** — 4096-byte stack frame DoS, Box<> mitigation for large account types
+- **Panic safety** — no `unwrap()`/`expect()` on user-controlled `Option`/`Result` paths; always return typed errors
+- **Input validation & metadata hygiene** — non-empty required fields, explicit length bounds, URI scheme allowlists for user-supplied strings
 
 ---
 
@@ -67,7 +75,7 @@ Once **both** the framework and testing approach are chosen, read the following 
 **before writing a single line of code**:
 
 1. **Always read first (both files):**
-   - `references/shared-base.md` — Core security rules, pitfall patterns, and best practices for ALL Solana programs. Sections 1–20 cover foundational security; sections 21–25 cover vulnerability-derived rules from real protocol audits (reward accounting, vault architecture, Token-2022 extension validation, admin key rotation, BPF stack frame limits).
+   - `references/shared-base.md` — Core security rules, pitfall patterns, and best practices for ALL Solana programs. Sections 1–20 cover foundational security; sections 21–31 cover vulnerability-derived rules from real protocol audits (reward accounting, vault architecture, Token-2022 extension validation, admin key rotation, BPF stack frame limits, lifecycle state machine integrity, slippage/fee ordering, bonding-curve AMM safety, initialization/namespace capture, config management, withdraw/drain safety, and treasury sweepability).
 
 2. **Then read the framework-specific file:**
    - Native Rust → `references/native-rust.md`
@@ -241,5 +249,9 @@ Each example folder contains:
 - **Staking / yield programs:** Pay special attention to shared-base §21 (reward accounting). Every reward payout path must update `reward_debt`. Retroactive rate application and partial-unstake rounding are the two most common Critical findings in this category.
 - **Share-based pools (stX/totalStaked):** Apply §21.4 (dead share price) and §21.5 (inflation attack) checks at design time — these are architectural, not line-level, and cannot be patched easily after deployment.
 - **Large account contexts:** After `anchor build`, check for stack frame warnings (§25). Apply `Box<>` to large account fields if the warning appears.
+- **AMM / bonding-curve programs:** Apply §26 (lifecycle state machine), §27 (slippage/fee), §28 (AMM safety), and §30 (withdraw/drain). Completion-threshold capping, post-cap slippage recheck, and terminal-state solvency are the top findings in this category.
+- **Programs with admin config instructions:** Apply §29 (initialization, namespace capture, user-param safety, config management). Every config write path must validate all fields; partial updates must use patch semantics to avoid silent zeroing.
+- **Programs with a fee treasury or protocol wallet:** Apply §31.4 — the treasury authority must be sweepable (valid signer path to move tokens out). Validate the ATA at config time, not at withdrawal time.
+- **User-supplied metadata (name, symbol, URI):** Apply §18 metadata hygiene — enforce non-empty, explicit length bounds, and URI scheme allowlists at the point of instruction processing.
 
 - **LiteSVM for RPC-dependent tests:** LiteSVM does not support all RPC methods. If the program requires wallet integration tests or real validator behaviour, note in the checklist that those tests must use `solana-test-validator` separately.
