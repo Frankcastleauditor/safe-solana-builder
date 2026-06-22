@@ -83,6 +83,7 @@ let vault = Vault::try_from_slice(&account.data.borrow())?;
 ```
 - Always use Borsh deserialization (`try_from_slice`) rather than manual byte casting.
 - Manual byte casting with transmutes or raw pointer reads is undefined behavior territory.
+- Only deserialize the full account after the discriminator or type tag has been validated.
 
 ### 2.2 Verify Data Length Before Deserializing
 ```rust
@@ -238,6 +239,13 @@ info.realloc(0, false)?;
 - Skipping step 2 (reassigning owner) means your program still "owns" a zero-balance account, wasting space.
 - Skipping step 3 (realloc) we must realloc to zero bytes otherwise rent must be deposited
 - The recipient must be a trusted address — never arbitrary user-supplied.
+- Centralize account closure in a shared helper so every close path applies the same sequence consistently.
+- The helper should perform the full native reclaim flow:
+  1. transfer lamports to the recipient
+  2. zero the source lamports
+  3. clear or zero the account data
+  4. reassign ownership to the System Program
+  5. reduce the data length to zero
 
 ---
 
@@ -323,6 +331,8 @@ Before submitting any instruction handler for review, verify:
 - [ ] `system_program.key == &system_program::ID` enforced before any System Program CPI
 - [ ] Account data re-read after every CPI
 - [ ] Account close performs: zero data → transfer lamports → assign to system program
+- [ ] Parent close either closes all dependent child accounts or rejects while children exist
+- [ ] All close paths use a shared helper that completes the full native close sequence
 - [ ] New accounts funded with `rent.minimum_balance(size)`, not hardcoded lamports
 - [ ] Initialization guard (check data is zeroed / flag is false before init)
 
