@@ -55,6 +55,7 @@ if data[0] != VAULT_DISCRIMINATOR {
 }
 ```
 - Without discriminators, an attacker can pass a `UserAccount` where a `VaultAccount` is expected if they have the same shape.
+- If discriminators/tags do not exist yet, add them before relying on deserialization for security checks.
 
 ### 1.5 Key Check (for Fixed Accounts)
 ```rust
@@ -64,6 +65,13 @@ if clock_sysvar.key != &sysvar::clock::ID {
 ```
 - Hardcode expected pubkeys for all fixed accounts: sysvars, known program IDs, config accounts.
 - Never trust position alone to identify a fixed account.
+- For System Program CPIs, always assert:
+```rust
+if system_program.key != &system_program::ID {
+    return Err(ProgramError::InvalidArgument);
+}
+```
+- Do this before constructing or invoking any `system_instruction::*` CPI.
 
 ---
 
@@ -75,6 +83,7 @@ let vault = Vault::try_from_slice(&account.data.borrow())?;
 ```
 - Always use Borsh deserialization (`try_from_slice`) rather than manual byte casting.
 - Manual byte casting with transmutes or raw pointer reads is undefined behavior territory.
+- Only deserialize the full account after the discriminator or type tag has been validated.
 
 ### 2.2 Verify Data Length Before Deserializing
 ```rust
@@ -92,12 +101,14 @@ let mut data = account.try_borrow_mut_data()?;  // mutable borrow for writing
 ```
 - Never hold both a mutable and immutable borrow of the same account simultaneously — this will panic at runtime.
 - Drop borrows before taking new ones on the same account.
+- In instruction handlers, prefer `try_borrow_data()` / `try_borrow_mut_data()` over raw `borrow()` / `borrow_mut()` so failed borrow returns custom error instead of panicking.
 
 ---
 
 ## 3. PDA DERIVATION — NATIVE RUST
 
 ### 3.1 Find and Store Canonical Bump at Init Time
+- On initialization, derive the expected PDA on-chain and verify the client-supplied account matches it before creating or writing any state.
 ```rust
 // At initialization
 let (vault_pda, bump) = Pubkey::find_program_address(
@@ -138,6 +149,10 @@ if expected_vault != *vault.key {
 
 ### 4.1 invoke — For Non-PDA-Signed CPIs
 ```rust
+if system_program.key != &system_program::ID {
+    return Err(ProgramError::InvalidArgument);
+}
+
 invoke(
     &system_instruction::transfer(from.key, to.key, lamports),
     &[from.clone(), to.clone(), system_program.clone()],
@@ -167,6 +182,7 @@ let updated_vault = Vault::try_from_slice(&vault_data)?;
 ```
 - Unlike Anchor's `.reload()`, in native Rust you must manually re-borrow and re-deserialize the account data after a CPI.
 - Never use a local variable that was deserialized before the CPI to make decisions after the CPI.
+- After CPI, any cached assumptions about externally touched accounts may be stale. Re-read data and revalidate any invariants you still depend on before continuing.
 
 ---
 
@@ -223,6 +239,13 @@ info.realloc(0, false)?;
 - Skipping step 2 (reassigning owner) means your program still "owns" a zero-balance account, wasting space.
 - Skipping step 3 (realloc) we must realloc to zero bytes otherwise rent must be deposited
 - The recipient must be a trusted address — never arbitrary user-supplied.
+- Centralize account closure in a shared helper so every close path applies the same sequence consistently.
+- The helper should perform the full native reclaim flow:
+  1. transfer lamports to the recipient
+  2. zero the source lamports
+  3. clear or zero the account data
+  4. reassign ownership to the System Program
+  5. reduce the data length to zero
 
 ---
 
@@ -261,6 +284,10 @@ impl From<MyError> for ProgramError {
 - `unwrap()` and `expect()` are banned in instruction handlers — they crash the entire program.
 - Use `?`, `ok_or()`, `unwrap_or_else()`, or explicit match patterns everywhere.
 
+### 7.3 Logging Discipline
+- Logging raw account metadata is useful for learning and debugging, but production code should avoid leaking unnecessary operational details.
+- Keep logs minimal, purposeful, and safe to expose in public transaction traces.
+
 ---
 
 ## 8. INSTRUCTION PARSING
@@ -291,16 +318,21 @@ Before submitting any instruction handler for review, verify:
 - [ ] Owner check on every data account before deserialization
 - [ ] Signer check on every authority account  
 - [ ] Discriminator check on every deserialized account
+- [ ] Foreign-program accounts validate type tag/discriminator
 - [ ] Key check on every fixed/known account (sysvars, programs)
 - [ ] Duplicate mutable account check between any two mutable accounts
 - [ ] Canonical bump stored at init, reused on subsequent calls
 - [ ] `try_from_slice` used for all deserialization (no raw byte casting)
 - [ ] Data length verified before deserialization
+- [ ] Account data borrows use `try_borrow_data` / `try_borrow_mut_data`
 - [ ] No `unwrap()` or `expect()` in instruction handlers
 - [ ] Checked arithmetic on all financial math
 - [ ] CPI callee program ID verified before invoke
+- [ ] `system_program.key == &system_program::ID` enforced before any System Program CPI
 - [ ] Account data re-read after every CPI
 - [ ] Account close performs: zero data → transfer lamports → assign to system program
+- [ ] Parent close either closes all dependent child accounts or rejects while children exist
+- [ ] All close paths use a shared helper that completes the full native close sequence
 - [ ] New accounts funded with `rent.minimum_balance(size)`, not hardcoded lamports
 - [ ] Initialization guard (check data is zeroed / flag is false before init)
 
